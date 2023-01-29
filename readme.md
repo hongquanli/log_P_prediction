@@ -1,3 +1,16 @@
+## Setting up the environment
+```
+conda create -n deepchem python=3.8
+conda activate deepchem
+pip3 install deepchem
+pip3 install tensorflow
+
+conda install pytorch torchvision torchaudio pytorch-cuda=11.7 -c pytorch -c nvidia
+conda install -c conda-forge rdkit==2018.09.3
+pip3 install pytorch-lightning jax torch_geometric jaxlib torch_sparse dgllife
+```
+
+## 
 This git repository contains the Supplementary Information to the publication 
 “Exploring the octanol-water partition coefficient dataset using deep learning techniques and data augmentation”:
 
