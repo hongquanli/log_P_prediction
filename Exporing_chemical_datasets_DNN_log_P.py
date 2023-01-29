@@ -10,18 +10,16 @@
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, 
 # WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-
 import tensorflow as tf
 import numpy as np
 import deepchem as dc
 from deepchem.feat.mol_graphs import ConvMol
 from deepchem.metrics import to_one_hot
-from deepchem.models import TensorGraph
-from deepchem.models.tensorgraph.layers import L2Loss
-from deepchem.models.tensorgraph.layers import Feature, GraphConv, BatchNorm, GraphPool, Dense, Dropout, GraphGather, \
-  SoftMax, \
-  Label, SoftMaxCrossEntropy, Weights, WeightedError, Stack
+from deepchem.models.losses import L2Loss
+from deepchem.models.layers import GraphConv, GraphPool, Dense, Dropout, GraphGather, Stack
 import csv
+from tensorflow.keras.layers import Input, Reshape, Conv2D, Flatten, Dense, Softmax
+from tensorflow.keras.layers import BatchNormalization
 
 #Reads data and converts data to ConvMol objects
 
@@ -29,46 +27,20 @@ def read_data(input_file_path):
     featurizer = dc.feat.ConvMolFeaturizer(use_chirality=True)
     loader = dc.data.CSVLoader(tasks=prediction_tasks, smiles_field="SMILES", featurizer=featurizer)
     dataset = loader.featurize(input_file_path, shard_size=8192)
-    # Initialize transformers
-    transformer = dc.trans.NormalizationTransformer(transform_w=True, dataset=dataset)
-    print("About to transform data")
-    dataset = transformer.transform(dataset)
-
     return dataset
 
-#Generation of batches from the data as input in network
-
-def default_generator(dataset,
-                      epochs=1,
-                      batch_size=50,
-                      predict=False,
-                      deterministic=True,
-                      pad_batches=True,
-                      labels=None,
-                      weights=None,
-                      atom_features=None,
-                      degree_slice=None,
-                      membership=None,
-                      deg_adjs=None):
-  for epoch in range(epochs):
-    print('Epoch number:', epoch)  
-    for ind, (X_b, y_b, w_b, ids_b) in enumerate(
-        dataset.iterbatches(
-          batch_size,
-          pad_batches=pad_batches,
-          deterministic=deterministic)):
-      d = {}
-      
-      for i, label in enumerate(labels):
-        d[label] =  np.expand_dims(y_b[:, i],1) 
-      d[weights] = w_b
-      multiConvMol = ConvMol.agglomerate_mols(X_b)
-      d[atom_features] = multiConvMol.get_atom_features()
-      d[degree_slice] = multiConvMol.deg_slice
-      d[membership] = multiConvMol.membership
-      for i in range(1, len(multiConvMol.get_deg_adjacency_lists())):
-        d[deg_adjs[i - 1]] = multiConvMol.get_deg_adjacency_lists()[i]
-      yield d
+def data_generator(dataset,batch_size,epochs=1):
+  for ind, (X_b, y_b, w_b, ids_b) in enumerate(dataset.iterbatches(batch_size, epochs,deterministic=True, pad_batches=True)):
+    print(ind)
+    # print(X_b)
+    # print('----------')
+    multiConvMol = ConvMol.agglomerate_mols(X_b)
+    inputs = [multiConvMol.get_atom_features(), multiConvMol.deg_slice, np.array(multiConvMol.membership)]
+    for i in range(1, len(multiConvMol.get_deg_adjacency_lists())):
+      inputs.append(multiConvMol.get_deg_adjacency_lists()[i])
+    labels = [y_b]
+    weights = [w_b]
+    yield (inputs, labels, weights)
 
 #Used for loading of trained model
 
@@ -86,117 +58,58 @@ def reshape_y_pred(y_true, y_pred):
 
 #Define working directory
 
-model_dir = working_directory
+model_dir = '.'
 
 #Define prediction task and directory of .csv file
 #csv file should include SMILES and the prediction task
 
 prediction_tasks = ['logP']
-train_dataset, test_dataset = read_data(data_directory)
+train_dataset = read_data('data.csv')
+test_dataset = read_data('data.csv')
 
-#Define model, batch size, learning rate
+# https://github.com/deepchem/deepchem/blob/master/examples/tutorials/Introduction_to_Graph_Convolutions.ipynb
+import tensorflow.keras.layers as layers
 
-model = TensorGraph(tensorboard=True,
-                    batch_size=50,
-                    learning_rate=0.0001,
-                    use_queue=False,
-                    model_dir=model_dir)
-#Placeholders for the chemical structures
-#Chirality is used; if chirality should not be used: atom_features = Feature(shape=(None, 75))
-atom_features = Feature(shape=(None, 78))
-degree_slice = Feature(shape=(None, 2), dtype=tf.int32)
-membership = Feature(shape=(None,), dtype=tf.int32)
-deg_adjs = []
+class MyGraphConvModel(tf.keras.Model):
 
-#Define structure of neural network 
+  def __init__(self,batch_size):
+    super(MyGraphConvModel, self).__init__()
+    self.gc1 = GraphConv(64, activation_fn=tf.nn.tanh)
+    self.batch_norm1 = layers.BatchNormalization()
+    self.gp1 = GraphPool()
 
-for i in range(0, 10 + 1):
-  deg_adj = Feature(shape=(None, i + 1), dtype=tf.int32)
-  deg_adjs.append(deg_adj)
-#Input 
-in_layer = atom_features
-#Layer 1
-for layer_size in [64, 64]:
-  gc1_in = [in_layer, degree_slice, membership] + deg_adjs
-  gc1 = GraphConv(layer_size, activation_fn=tf.nn.relu, in_layers=gc1_in)
-  batch_norm1 = BatchNorm(in_layers=[gc1])
-  gp_in = [batch_norm1, degree_slice, membership] + deg_adjs
-  in_layer1 = GraphPool(in_layers=gp_in)
-#Layer 2
-for layer_size in [128, 128]:
-  gc2_in = [in_layer1, degree_slice, membership] + deg_adjs
-  gc2 = GraphConv(layer_size, activation_fn=tf.nn.relu, in_layers=gc2_in)
-  batch_norm2 = BatchNorm(in_layers=[gc2])
-  gp2_in = [batch_norm2, degree_slice, membership] + deg_adjs
-  in_layer2 = GraphPool(in_layers=gp2_in)
-dense = Dense(out_channels=256, activation_fn=tf.nn.relu, in_layers=[in_layer2])
-batch_norm3 = BatchNorm(in_layers=[dense])
-batch_norm3 = Dropout(0.1, in_layers=[batch_norm3])
-readout = GraphGather(
-  batch_size=50,
-  activation_fn=tf.nn.tanh,
-  in_layers=[batch_norm3, degree_slice, membership] + deg_adjs)
-costs = []
-labels = []
-regression = Dense( out_channels=1, activation_fn=None, in_layers=[readout])
-model.add_output(regression)
-label = Label(shape=(None, 1))
-labels.append(label)
-cost = L2Loss(in_layers=[label, regression])
-costs.append(cost)
-all_cost = Stack(in_layers=costs, axis=1)
-weights = Weights(shape=(None, len(prediction_tasks)))
-loss = WeightedError(in_layers=[all_cost, weights])
-model.set_loss(loss)
+    self.gc2 = GraphConv(128, activation_fn=tf.nn.tanh)
+    self.batch_norm2 = layers.BatchNormalization()
+    self.gp2 = GraphPool()
 
-#Define Training of neural network and the number of epochs for training
-gene = default_generator(train_dataset, epochs=60, predict=True, pad_batches=True,
-                         labels=labels, weights=weights, atom_features=atom_features, degree_slice=degree_slice,
-                         membership=membership, deg_adjs=deg_adjs)
-model.fit_generator(gene)
-model.save()
+    self.dense1 = layers.Dense(256, activation=tf.nn.tanh)
+    self.batch_norm3 = layers.BatchNormalization()
+    self.dropout = layers.Dropout(0.1)
+    self.readout = GraphGather(batch_size=batch_size, activation_fn=tf.nn.tanh)
 
-#Predict with model
-#Load the model, which was previously trained
-model2 = TensorGraph.load_from_dir(model.model_dir)  
-gene = default_generator(train_dataset, epochs=1, predict=True, pad_batches=True,
-                         labels=labels, weights=weights, atom_features=atom_features, degree_slice=degree_slice,
-                         membership=membership, deg_adjs=deg_adjs)
-labels = layer_reference(model2, labels)
-weights = layer_reference(model2, weights)
-atom_features = layer_reference(model2, atom_features)
-degree_slice = layer_reference(model2, degree_slice)
-membership = layer_reference(model2, membership)
-deg_adjs = layer_reference(model2, deg_adjs)
-#Load the train_dataset for evaluation 
-gene = default_generator(train_dataset, epochs=1, predict=True, pad_batches=True,
-                         labels=labels, weights=weights, atom_features=atom_features, degree_slice=degree_slice,
-                         membership=membership, deg_adjs=deg_adjs)
-#Load the test_dataset for evaluation
-gene1 = default_generator(test_dataset, epochs=1, predict=True, pad_batches=True,
-                         labels=labels, weights=weights, atom_features=atom_features, degree_slice=degree_slice,
-                         membership=membership, deg_adjs=deg_adjs)
+    self.regression = layers.Dense(1,activation=None)
 
-metric = dc.metrics.Metric(dc.metrics.pearson_r2_score, np.mean,  mode = "regression")
-rms=dc.metrics.Metric(dc.metrics.rms_score,np.mean,mode='regression')
+  def call(self, inputs):
+    gc1_output = self.gc1(inputs)
+    batch_norm1_output = self.batch_norm1(gc1_output)
+    gp1_output = self.gp1([batch_norm1_output] + inputs[1:])
 
-#Check performance on the training-dataset
+    gc2_output = self.gc2([gp1_output] + inputs[1:])
+    batch_norm2_output = self.batch_norm2(gc2_output)
+    gp2_output = self.gp2([batch_norm2_output] + inputs[1:])
 
-print("Evaluating on train data")
-train_predictions = model2.predict_on_generator(gene)
-train_predictions = reshape_y_pred(train_dataset.y,train_predictions)
-train_scores = metric.compute_metric(train_dataset.y, train_predictions,train_dataset.w)
-train_scores2 = rms.compute_metric(train_dataset.y, train_predictions, train_dataset.w)
-print("Train r²: %f" % train_scores)
-print("Train rms: %f" % train_scores2)
+    dense1_output = self.dense1(gp2_output)
+    batch_norm3_output = self.batch_norm3(dense1_output)
+    dropout = self.dropout(batch_norm3_output)
+    readout_output = self.readout([dropout] + inputs[1:])
 
-#Check performance on the test_dataset
+    return self.regression(readout_output)
 
-print("Evaluating on test data")
-test_predictions = model2.predict_on_generator(gene1)
-test_predictions = reshape_y_pred(test_dataset.y, test_predictions)
-test_scores = metric.compute_metric(test_dataset.y, test_predictions, test_dataset.w)
-test_scores2 = rms.compute_metric(test_dataset.y, test_predictions, test_dataset.w)
-print("Test r²: %f" % test_scores)
-print("Test rms: %f" % test_scores2)
 
+batch_size = 3
+model = dc.models.KerasModel(MyGraphConvModel(batch_size=batch_size), loss=dc.models.losses.L2Loss(), model_dir='model')
+model.fit_generator(data_generator(train_dataset,batch_size=batch_size,epochs=1000))
+print('Training set score:', model.evaluate_generator(data_generator(train_dataset,batch_size=batch_size),[dc.metrics.mean_squared_error]))
+# model.save()
+
+print(model.predict_on_generator(data_generator(train_dataset,batch_size=batch_size)))
